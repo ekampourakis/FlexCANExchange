@@ -34,46 +34,109 @@ int16_t FlexCANExchange::SearchContainers(uint32_t ID) {
     return -1;
 }
 
-int8_t FlexCANExchange::Request(
-    CAN_message_t TX, uint32_t ResponseID, uint8_t Retries, uint16_t Timeout, CAN_message_t *RX) {
-
-    // If it does overwrite it?
-    // Create the container and start initializing it
-    // Search if another with same ID exists
+int16_t FlexCANExchange::Request(CAN_message_t TX, uint32_t ResponseID, uint8_t Retries,
+    uint16_t Timeout, CAN_message_t *RX, bool Overwrite) {
+    // Create the container pointer
     FlexCANExchangeContainer *Ptr;
+    // Search if another with same ID exists
+    // If it does overwrite it
     if (const int16_t PresentContainer = SearchContainers(ResponseID) == -1) {
         // Not found. Create a new container
+        if (_ActiveContainers >= _MaxContainers) {
+            return -2;
+        }
         Ptr = &_Containers[_ActiveContainers++];
     } else {
         // Already exists
-        Ptr = &_Containers[PresentContainer];
+        if (Overwrite) {
+            Ptr = &_Containers[PresentContainer];
+        } else {
+            if (_Containers[PresentContainer].Success) {
+                return PresentContainer;
+            } else {
+                Tick(PresentContainer);
+                return -3;
+            }
+        }
     }
     // Reset the container
     *Ptr = FlexCANExchangeContainer();
     Ptr->ResponseID = ResponseID;
     Ptr->Timeout = Timeout;
     Ptr->TriesLeft = Retries;
-    // Ptr->LastTry = 0;
     Ptr->Request = TX;
     Ptr->ResponsePtr = RX;
-
-
-    return -1;
-}
-
-bool FlexCANExchange::Handle(CAN_message_t *Message) {
-    if (_Containers != nullptr) {
+    if (Transmit(Ptr->Request)) {
+        Ptr->LastTry = millis();
+        return -1;
     }
-    return false;
+    return -4;
 }
 
-// if (_CAN == nullptr || _Containers != nullptr && ) {
-// 	// Put it in the containers
+void FlexCANExchange::Tick(int16_t Container) {
+    if (_Containers != nullptr && _CAN != nullptr && _ActiveContainers > 0) {
+        if (Container == -1) {
+            for (uint8_t Index = 0; Index < _ActiveContainers; Index++) {
+                Tick(Index);
+            }
+        } else {
+            if (Container < _ActiveContainers) {
+                // Handle the sending of the container
+                FlexCANExchangeContainer *Ptr = &_Containers[Container];
+                if (Ptr->TriesLeft > 0) {
+                    if (millis() > Ptr->LastTry + Ptr->Timeout) {
+                        if (Transmit(Ptr->Request)) {
+                            Ptr->TriesLeft--;
+                            Ptr->LastTry = millis();
+                        }
+                    }
+                } else {
+                    Ptr->Expired = true;
+                    GarbageCollection();
+                }
+            } else {
+                // index out of bounds
+            }
+        }
+    }
+}
 
-// 	if (!_CAN.write(Message)) {
-// 		// If the write wasn't successful, then add one more try
-// 	}
-// 	return true;
-// }
+CAN_message_t FlexCANExchange::GetResponse(uint8_t Container) {
+    CAN_message_t Response;
+    if (Container < _ActiveContainers) {
+        if (_Containers[Container].Success) {
+            Response = _Containers[Container].Response;
+            _Containers[Container].Processed = true;
+            GarbageCollection();
+        }
+    }
+    return Response;
+}
 
-// return 1;
+void FlexCANExchange::GarbageCollection() {
+    for (uint8_t Index = 0; Index < _ActiveContainers; Index++) {
+        if (_Containers[Index].Expired || _Containers[Index].Processed) {
+            for (uint8_t ReplaceIndex = Index; ReplaceIndex < (_ActiveContainers - 1); ReplaceIndex++) {
+                _Containers[ReplaceIndex] = _Containers[ReplaceIndex + 1];
+            }
+            _ActiveContainers--;
+        }
+    }
+}
+
+bool FlexCANExchange::Process(CAN_message_t RX) {
+    const int16_t Container = SearchContainers(RX.id);
+    if (Container == -1) {
+        return false;
+    }
+    // TODO: Check this condition
+    FlexCANExchangeContainer *Ptr = &_Containers[Container];
+    if (Container > -1 && !(Ptr->Expired || Ptr->Success)) {
+        Ptr->Success = true;
+        Ptr->Response = RX;
+        if (Ptr->ResponsePtr != nullptr) {
+            *(Ptr->ResponsePtr) = RX;
+        }
+    }
+    return true;
+}
